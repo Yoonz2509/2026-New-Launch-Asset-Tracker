@@ -426,51 +426,149 @@ let db = {
   driveLinks:{},   // prodId → url   (ONE per product)
 };
 
+/* ═══════════════════════════════════════════
+   SAVE / LOAD  — Cloudflare KV backend
+   Falls back to localStorage if API unreachable
+═══════════════════════════════════════════ */
 let _saveTimer=null;
-function save(){
-  // show saving state immediately
+let _lastSavedJson='';
+let _kvAvailable=null; // null=unknown, true/false
+
+function setSaveUI(state){
   const bar=document.getElementById('autosave-bar');
   const st=document.getElementById('save-status');
   const lbl=document.getElementById('save-label');
-  if(bar){bar.className='autosave-bar saving';}
-  if(st){st.className='sb-save-status saving';}
-  if(lbl){lbl.textContent='Saving...';}
-  // debounce actual write by 600ms
-  clearTimeout(_saveTimer);
-  _saveTimer=setTimeout(()=>{
-    try{localStorage.setItem('gooby_at2',JSON.stringify(db));}catch(e){}
+  if(state==='saving'){
+    if(bar)bar.className='autosave-bar saving';
+    if(st)st.className='sb-save-status saving';
+    if(lbl)lbl.textContent='Saving...';
+  } else if(state==='saved'){
     if(bar){bar.className='autosave-bar saved';setTimeout(()=>{bar.className='autosave-bar';},1400);}
-    if(st){st.className='sb-save-status saved';}
-    if(lbl){
-      const now=new Date();
-      lbl.textContent='Saved '+now.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'});
-    }
+    if(st)st.className='sb-save-status saved';
+    if(lbl){const n=new Date();lbl.textContent='Saved '+n.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'});}
     setTimeout(()=>{if(st)st.className='sb-save-status';},3000);
-  },600);
+  } else if(state==='error'){
+    if(bar)bar.className='autosave-bar';
+    if(st)st.className='sb-save-status';
+    if(lbl)lbl.textContent='Save failed — retrying...';
+  } else if(state==='offline'){
+    if(bar)bar.className='autosave-bar';
+    if(st)st.className='sb-save-status';
+    if(lbl)lbl.textContent='Saved locally (offline)';
+  }
 }
+
+async function writeToKV(data){
+  const res=await fetch('/api/data',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(data)
+  });
+  if(!res.ok) throw new Error('KV write failed: '+res.status);
+  return true;
+}
+
+async function readFromKV(){
+  const res=await fetch('/api/data');
+  if(!res.ok) throw new Error('KV read failed: '+res.status);
+  return res.json();
+}
+
+function saveToLocal(){
+  try{localStorage.setItem('gooby_at2',JSON.stringify(db));}catch(e){}
+}
+
+function save(){
+  setSaveUI('saving');
+  saveToLocal(); // always write local immediately
+  clearTimeout(_saveTimer);
+  _saveTimer=setTimeout(async()=>{
+    const payload=JSON.stringify(db);
+    if(payload===_lastSavedJson){setSaveUI('saved');return;} // no change
+    try{
+      await writeToKV(db);
+      _lastSavedJson=payload;
+      _kvAvailable=true;
+      setSaveUI('saved');
+    } catch(e){
+      _kvAvailable=false;
+      setSaveUI('offline');
+    }
+  },800);
+}
+
 function manualSave(){
   clearTimeout(_saveTimer);
-  try{localStorage.setItem('gooby_at2',JSON.stringify(db));}catch(e){}
-  const bar=document.getElementById('autosave-bar');
-  const st=document.getElementById('save-status');
-  const lbl=document.getElementById('save-label');
-  if(bar){bar.className='autosave-bar saved';setTimeout(()=>{bar.className='autosave-bar';},1400);}
-  if(st){st.className='sb-save-status saved';}
-  if(lbl){const now=new Date();lbl.textContent='Saved '+now.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'});}
-  setTimeout(()=>{if(st)st.className='sb-save-status';},3000);
-  toast('💾 Saved successfully');
+  saveToLocal();
+  setSaveUI('saving');
+  writeToKV(db).then(()=>{
+    _lastSavedJson=JSON.stringify(db);
+    _kvAvailable=true;
+    setSaveUI('saved');
+    toast('💾 Saved to cloud');
+  }).catch(()=>{
+    _kvAvailable=false;
+    setSaveUI('offline');
+    toast('💾 Saved locally (no cloud)');
+  });
 }
-function load(){
+
+async function load(){
+  // 1. load from KV first
+  try{
+    const remote=await readFromKV();
+    if(remote && remote.products){
+      db=remote;
+      _lastSavedJson=JSON.stringify(db);
+      _kvAvailable=true;
+      ensureDbFields();
+      return;
+    }
+  }catch(e){
+    _kvAvailable=false;
+  }
+  // 2. fallback to localStorage
   try{
     const raw=localStorage.getItem('gooby_at2');
-    if(raw) db=JSON.parse(raw);
-    if(!db.assetTypes) db.assetTypes=JSON.parse(JSON.stringify(DEFAULT_ASSET_TYPES));
-    if(!db.checks) db.checks={};
-    if(!db.assignees) db.assignees={};
-    if(!db.comments) db.comments={};
-    if(!db.driveLinks) db.driveLinks={};
+    if(raw){db=JSON.parse(raw);}
   }catch(e){}
+  ensureDbFields();
 }
+
+function ensureDbFields(){
+  if(!db.assetTypes) db.assetTypes=JSON.parse(JSON.stringify(DEFAULT_ASSET_TYPES));
+  if(!db.checks) db.checks={};
+  if(!db.assignees) db.assignees={};
+  if(!db.comments) db.comments={};
+  if(!db.driveLinks) db.driveLinks={};
+}
+
+/* ── Poll for remote changes every 30s ── */
+setInterval(async()=>{
+  if(!_kvAvailable) return;
+  try{
+    const remote=await readFromKV();
+    if(!remote||!remote.products) return;
+    const remoteJson=JSON.stringify(remote);
+    if(remoteJson!==_lastSavedJson){
+      db=remote;
+      _lastSavedJson=remoteJson;
+      ensureDbFields();
+      // re-render current view
+      const active=document.querySelector('.view.active');
+      if(active){
+        const id=active.id.replace('view-','');
+        if(id==='dashboard') renderDashboard();
+        else if(id==='products') renderProducts();
+        else if(id==='search') runSearch();
+        else if(id==='settings') renderSettings();
+      }
+      updateSidebarStats();
+      const lbl=document.getElementById('save-label');
+      if(lbl)lbl.textContent='Updated from cloud';
+    }
+  }catch(e){}
+},30000);
 function ik(prodId,scope,assetId){return `${prodId}__${scope}__${assetId}`;}
 
 /* ═══════════════════════════════════════════
@@ -1061,13 +1159,17 @@ function toast(msg){
 /* ═══════════════════════════════════════════
    INIT
 ═══════════════════════════════════════════ */
-document.addEventListener('DOMContentLoaded',()=>{
-  load();
+document.addEventListener('DOMContentLoaded',async()=>{
+  // show loading state
+  const lbl=document.getElementById('save-label');
+  if(lbl)lbl.textContent='Loading from cloud...';
+  await load();
   document.getElementById('sb-date').textContent=new Date().toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'});
   document.getElementById('nav-prod-count').textContent=db.products.length;
   updateSidebarStats();
   renderDashboard();
   if(!db.products.length) seedDemo();
+  setSaveUI('saved');
 });
 function seedDemo(){
   db.products=[{id:'p_demo1',sku:'72108',name:'Stretch Fleece',category:'Apparel',
